@@ -1,60 +1,183 @@
-Program: CallGhost
-Section 1: Explanation on the program and what id does
-Main idea: A program which listens an interface and provides SRT and TXT output from it, for later passing to other tools.
-Working instructions
-When program is started will try to locate all resources needed for this task downloading or requesting the path to required tools such as ffmpeg for audio conversion if needed
-It will present a menu with all possible input devices to capture sound from, it will display which ones are emiting sound or not with a small indicator of being silent or active
-It will capture audio from the selected device on previous menu
-When audio goes silent for a certain ammount of seconds, it beep three times to default output device and will show the message paused to allow user to continue recording once audio is restablished or end the program
-Program ending, can be done anytime pressing esc in menu, it will stop and generate ogg, srt and txt files in the desired output folder
-Program will read init parameters from a ini file, but will allow to override by passing them as parameter, create a ini file  with comments and defaults
-You can read file transcribe_summary.py to check which are the parameters, group in sections
-init config file notes and sections
-# app config and paths to tools
-# default capture mode or live device with their parameters
-# default capture spects format (16khz mono)
-# default capture outputs recording/YYY_MM_DD_recording.ogg, recording/YYY_MM_DD_recording.srt, recording/YYY_MM_DD_recording.txt
+CallGhost - Build Instructions Prompt Pack
 
-Section 2: What you need to implement
+Use this file as a ready-to-copy prompt set for AI coding agents.
+It includes:
+1) A single-pass prompt.
+2) A multi-step prompt sequence.
 
-Task: Transform transcribe_summary.py into CallGhost.py with dual-mode execution logic.
+================================================================
+PROMPT 1 - SINGLE PASS (FULL BUILD IN ONE GO)
+================================================================
+You are implementing a Python program named CallGhost.py.
 
-1. Startup Logic (No Arguments):
+Goal:
+Build a local speech-to-text utility with two modes:
+- file mode: transcribe an input audio file to TXT + SRT
+- live mode: capture from an input audio device, support chapter-based recording, and generate TXT + SRT + final audio per chapter
 
-If sys.argv is empty (length 1), initiate the Interactive Mode.
+Core requirements:
+1. CLI:
+- Use argparse with subcommands: file, live
+- Support --config config.ini for defaults; CLI flags override config values
+- If no args are provided, run interactive startup:
+  - list available input devices
+  - monitor 3 seconds and show simple activity indicator (Active/Silent)
+  - ask user to choose device index
 
-Device Menu: Use list_input_devices() to print a numbered list.
+2. File mode:
+- Input: audio path
+- Output: txt + srt files
+- Use Whisper local model
+- Handle missing input, missing ffmpeg, and path errors with actionable messages
 
-Live VU-Meter: Before the user picks a device, run a 3-second "silent monitor" loop. Show a simple ASCII bar [###  ] or a "Silent/Active" indicator next to each device based on rms() levels.
+3. Live mode:
+- Capture input audio and manage chapter flow:
+  - Start chapter 001 automatically
+  - SPACE closes current chapter and triggers background processing
+  - SPACE again (only after previous processing is complete) starts next chapter (002, 003, ...)
+  - ESC closes active chapter (if any), processes it, then exits cleanly
+  - If silence lasts >= stop_when_silent_for: beep 3 times, auto-close chapter, process it, then wait for SPACE/ESC
+- For each chapter generate:
+  - {prefix}_NNN.txt
+  - {prefix}_NNN.srt
+  - {prefix}_NNN.ogg (or selected format)
+- Keep processing sequential (one chapter processing thread at a time)
 
-User Pick: Wait for input() to select the device index.
+4. Audio + transcription behavior:
+- Capture as mono 16k for Whisper compatibility
+- Keep robust formatting for SRT timestamps
+- Preserve/implement overlap-aware deduplication logic where needed
 
-2. Execution Logic (With Arguments):
+5. Config:
+- Auto-create config.ini with commented defaults if missing
+- Include app/capture/audio/output sections
 
-If arguments are provided, bypass the menu and execute the requested mode (live or file) immediately, maintaining current functionality.
+6. Docs + quality:
+- Keep code readable and typed
+- Add clear docstrings and concise comments for non-obvious logic
+- Update README.md in English with:
+  - setup
+  - usage
+  - chapter controls
+  - practical use cases
+  - responsible use
+  - CPU vs CUDA guidance
+  - lessons learned and prompt-writing tips
 
-3. Silence Beep Alert (New Feature):
+7. Validation:
+- Run python -m py_compile CallGhost.py
+- Show brief summary of files changed and key behaviors implemented
 
-In run_live_mode, when silent_for >= stop_when_silent_for:
+Constraints:
+- Do not add unnecessary external dependencies
+- Do not perform broad refactors outside required scope
+- Keep behavior predictable and user-facing messages professional
 
-Action: Trigger three system beeps (e.g., using print('\a') or a simple sine wave via sounddevice).
+================================================================
+PROMPT 2 - MULTI-STEP MODE: STEP 1 (CLI + CONFIG + INTERACTIVE START)
+================================================================
+Implement only the following:
 
-UI: Display a prominent "--- PAUSED (Silence Detected) ---" message.
+1) argparse structure with subcommands:
+- file
+- live
 
-Resume: Wait for audio levels to exceed rms_threshold to resume recording automatically, or wait for a keypress to exit.
+2) --config handling:
+- load defaults from config.ini
+- auto-create config.ini if missing
+- CLI overrides config values
 
-4. Config Persistence:
+3) no-arg interactive startup:
+- list input devices
+- monitor activity for 3 seconds and print Active/Silent indicator
+- prompt for device index
+- continue into live mode
 
-Auto-generate config.ini if it doesn't exist.
+Do not implement chapter mode yet.
+After implementation:
+- run python -m py_compile CallGhost.py
+- report only what changed in CLI/config/interactive startup.
 
-Ensure all argparse defaults are read from this file but can be overridden by CLI flags.
+================================================================
+PROMPT 3 - MULTI-STEP MODE: STEP 2 (FILE MODE END-TO-END)
+================================================================
+Using existing structure, implement/refine file mode only:
 
-5. Refinement:
+- Transcribe one audio file with Whisper
+- Generate TXT and SRT outputs
+- Support --output-dir, --txt-out, --srt-out
+- Handle missing input file and missing ffmpeg with clear errors
+- Keep implementation typed and readable
 
-Keep all the overlap deduplication (dedupe_prefix_by_words) and the incremental writer logic.
+Do not change live mode behavior in this step.
+After implementation:
+- run python -m py_compile CallGhost.py
+- summarize file mode behavior and edge cases handled.
 
-Ensure ESC key (or Ctrl+C) triggers the final-pass strategy for maximum SRT quality before closing.
+================================================================
+PROMPT 4 - MULTI-STEP MODE: STEP 3 (LIVE CHAPTER MODE + THREADING)
+================================================================
+Implement chapter-based live mode:
 
-6. Final touches: 
-Create or append to .gitignore what is not required to run, create a default output directory with a README.md indicating this file is kept for creating the directory and is the default place to store generated audio and text files
- 
+- Auto-start chapter 001
+- SPACE:
+  - if recording: close chapter and process in background
+  - if idle and processing done: start next chapter
+  - if processing not done: block SPACE and show status message
+- ESC:
+  - close active chapter if any
+  - process pending chapter
+  - exit cleanly
+- Silence timeout:
+  - beep 3 times
+  - close chapter
+  - process it
+  - remain waiting for SPACE/ESC
+
+Output naming:
+- {prefix}_001, {prefix}_002...
+- write txt, srt, final audio per chapter
+
+Processing constraint:
+- one chapter processing worker at a time
+
+After implementation:
+- run python -m py_compile CallGhost.py
+- provide short explanation of chapter state machine.
+
+================================================================
+PROMPT 5 - MULTI-STEP MODE: STEP 4 (DOCS + POLISH + VALIDATION)
+================================================================
+Finalize docs and UX:
+
+1) Ensure all user messages/comments/help text are professional English.
+2) Update README.md with:
+- setup and quickstart
+- chapter control behavior
+- practical use cases (class, meeting, video/course/talk, interviews)
+- responsible use section
+- CPU vs CUDA comparison
+- lessons learned from AGENTS.md principles
+- better prompt writing tips for vibe coding tools
+3) Add/verify GPL license file.
+4) Run:
+- python -m py_compile CallGhost.py
+- python CallGhost.py --help
+5) Return a concise release-style summary:
+- what changed
+- why
+- risks/limitations
+
+================================================================
+PROMPT 6 - OPTIONAL MAINTENANCE PASS
+================================================================
+Perform a non-functional maintenance pass:
+- tighten wording in help/messages
+- improve docstrings/comments where unclear
+- keep behavior unchanged
+- verify with python -m py_compile CallGhost.py
+
+Return only:
+- files touched
+- no-behavior-change confirmation
+- any residual technical debt notes

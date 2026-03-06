@@ -11,7 +11,6 @@ Architecture:
 import argparse
 import configparser
 import os
-import queue
 import re
 import shutil
 import subprocess
@@ -42,11 +41,10 @@ try:
 except Exception:
     winsound = None
 
-# Resumen de arquitectura:
-# - Modo "file": transcribe un archivo completo y genera TXT/SRT una sola vez.
-# - Modo "live": captura audio por dispositivo, transcribe por chunks con solape y
-#   escribe TXT/SRT de forma incremental para monitorizar con Get-Content -Wait.
-# - La captura y la transcripcion se desacoplan con una cola para evitar bloqueos.
+# Architecture summary:
+# - "file" mode transcribes a complete audio file and generates TXT/SRT once.
+# - "live" mode captures device audio and processes each chapter into TXT/SRT/audio.
+# - Chapter processing runs in a background worker while the main loop remains interactive.
 
 TARGET_SR = 16000
 DEFAULT_CHUNK_SECONDS = 6.0
@@ -363,7 +361,7 @@ def to_mono_float32(block: np.ndarray) -> np.ndarray:
 
 def list_input_devices() -> List[Tuple[int, Dict]]:
     if sd is None:
-        raise RuntimeError("sounddevice no esta instalado. Instala con: pip install sounddevice")
+        raise RuntimeError("sounddevice is not installed. Install it with: pip install sounddevice")
 
     devices = sd.query_devices()
     result: List[Tuple[int, Dict]] = []
@@ -375,12 +373,12 @@ def list_input_devices() -> List[Tuple[int, Dict]]:
 
 def print_input_devices(devices: List[Tuple[int, Dict]]) -> None:
     if not devices:
-        print("No se encontraron dispositivos de entrada.")
+        print("No input devices were found.")
         return
 
-    print("Dispositivos de entrada disponibles:")
+    print("Available input devices:")
     for idx, dev in devices:
-        name = dev.get("name", "(sin nombre)")
+        name = dev.get("name", "(unnamed)")
         max_ch = dev.get("max_input_channels", 0)
         sr = int(dev.get("default_samplerate", 0) or 0)
         print(f"  [{idx}] {name} | in_channels={max_ch} | default_sr={sr}")
@@ -392,21 +390,21 @@ def pick_input_device(
     device_index: Optional[int],
 ) -> Tuple[int, Dict]:
     if not devices:
-        raise RuntimeError("No hay dispositivos de entrada disponibles.")
+        raise RuntimeError("No input devices are available.")
 
     by_index = {idx: dev for idx, dev in devices}
 
     if device_index is not None:
         if device_index in by_index:
             return device_index, by_index[device_index]
-        raise ValueError(f"No existe device-index {device_index} o no es de entrada.")
+        raise ValueError(f"Device index {device_index} does not exist or is not an input device.")
 
     if input_device:
         needle = input_device.lower()
         matches = [(i, d) for i, d in devices if needle in str(d.get("name", "")).lower()]
         if matches:
             return matches[0]
-        raise ValueError(f"No se encontro dispositivo que contenga: {input_device}")
+        raise ValueError(f"No device name contains: {input_device}")
 
     auto_needles = ["cable output", "vb-audio", "vb audio", "cable"]
     for needle in auto_needles:
@@ -429,14 +427,14 @@ def interactive_startup(args: argparse.Namespace) -> argparse.Namespace:
     """Run interactive live startup when no CLI arguments are provided."""
     devices = list_input_devices()
     if not devices:
-        raise RuntimeError("No hay dispositivos de entrada disponibles.")
+        raise RuntimeError("No input devices are available.")
 
-    print("Dispositivos detectados:")
+    print("Detected input devices:")
     for idx, dev in devices:
-        print(f"  [{idx}] {dev.get('name', '(sin nombre)')}")
+        print(f"  [{idx}] {dev.get('name', '(unnamed)')}")
 
     print()
-    print("Monitorizando actividad durante 3 segundos...")
+    print("Monitoring activity for 3 seconds...")
     levels = monitor_devices_once(
         devices=devices,
         duration_seconds=DEVICE_MONITOR_SECONDS,
@@ -445,12 +443,12 @@ def interactive_startup(args: argparse.Namespace) -> argparse.Namespace:
     for idx, dev in devices:
         level = levels.get(idx, 0.0)
         bar, status = render_activity_indicator(level, float(args.rms_threshold))
-        print(f"  [{idx}] {bar} {status:<6} | {dev.get('name', '(sin nombre)')}")
+        print(f"  [{idx}] {bar} {status:<6} | {dev.get('name', '(unnamed)')}")
 
     print()
-    raw = input("Selecciona indice de dispositivo para grabar (ESC/Ctrl+C para salir): ").strip()
+    raw = input("Select device index to record (ESC/Ctrl+C to exit): ").strip()
     if not raw:
-        raise ValueError("Entrada vacia. Debes indicar un indice numerico de dispositivo.")
+        raise ValueError("Empty input. You must provide a numeric device index.")
     args.device_index = int(raw)
     args.input_device = None
     args.mode = "live"
@@ -595,14 +593,14 @@ def convert_wav_to_audio(
         return
     ffmpeg_path = resolve_ffmpeg_path(ffmpeg_hint)
     if ffmpeg_path is None:
-        raise RuntimeError("ffmpeg no esta disponible para convertir audio final.")
+        raise RuntimeError("ffmpeg is not available to convert the final audio.")
     cmd = [ffmpeg_path, "-y", "-i", str(wav_path)]
     if audio_format == "ogg":
         cmd.extend(["-c:a", "libopus", "-b:a", "64k"])
     elif audio_format == "mp3":
         cmd.extend(["-c:a", "libmp3lame", "-b:a", "128k"])
     else:
-        raise ValueError(f"Formato de audio no soportado: {audio_format}")
+        raise ValueError(f"Unsupported audio format: {audio_format}")
     cmd.append(str(output_path))
     subprocess.run(cmd, check=True, capture_output=True, text=True)
 
@@ -629,7 +627,7 @@ class IncrementalWriters:
         deduped = dedupe_prefix_by_words(self.txt_tail, text)
         if not deduped:
             return
-        # Doble salto para mejorar legibilidad del stream en modo live.
+        # Add a blank line for better readability in live incremental output.
         self._txt_fh.write(deduped + "\n\n")
         self._txt_fh.flush()
         self.txt_tail = tail_words((self.txt_tail + " " + deduped).strip())
@@ -659,14 +657,14 @@ class IncrementalWriters:
 def run_file_mode(args: argparse.Namespace) -> int:
     audio_path = Path(args.audio).expanduser().resolve()
     if not audio_path.exists():
-        print(f"Archivo no encontrado: {audio_path}")
+        print(f"Audio file not found: {audio_path}")
         return 1
 
     ffmpeg_path = resolve_ffmpeg_path(getattr(args, "ffmpeg_path", ""))
     if ffmpeg_path is None:
         print(
-            "Error: no se encontro ffmpeg. Configura app.ffmpeg_path en config.ini, "
-            "coloca bin/ffmpeg.exe o agrega ffmpeg al PATH."
+            "Error: ffmpeg was not found. Configure app.ffmpeg_path in config.ini, "
+            "place bin/ffmpeg.exe, or add ffmpeg to PATH."
         )
         return 1
 
@@ -680,10 +678,10 @@ def run_file_mode(args: argparse.Namespace) -> int:
     print(f"SRT: {srt_path}")
     print(f"TXT: {txt_path}")
 
-    print(f"Cargando modelo Whisper ({args.model}, {args.device_compute})...")
+    print(f"Loading Whisper model ({args.model}, {args.device_compute})...")
     model = whisper.load_model(args.model, device=args.device_compute)
 
-    print("Transcribiendo archivo...")
+    print("Transcribing file...")
     result = model.transcribe(
         str(audio_path),
         language=args.language,
@@ -714,13 +712,13 @@ def run_file_mode(args: argparse.Namespace) -> int:
             fh.write(f"{format_srt_timestamp(start)} --> {format_srt_timestamp(end)}\n")
             fh.write(text + "\n\n")
 
-    print("Listo.")
+    print("Done.")
     return 0
 
 
 def run_live_mode(args: argparse.Namespace) -> int:
     if sd is None:
-        print("Error: sounddevice no esta instalado. Ejecuta: pip install sounddevice")
+        print("Error: sounddevice is not installed. Run: pip install sounddevice")
         return 1
 
     devices = list_input_devices()
@@ -743,212 +741,194 @@ def run_live_mode(args: argparse.Namespace) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if args.output_prefix:
-        base = args.output_prefix
+        base = str(args.output_prefix)
     else:
-        base = datetime.now().strftime("live_%Y%m%d_%H%M%S")
+        base = datetime.now().strftime("%Y_%m_%d_recording")
 
-    txt_path = out_dir / f"{base}.txt"
-    srt_path = out_dir / f"{base}.srt"
     final_audio_format = str(args.live_audio_format)
-    if args.live_audio_out:
-        final_audio_path = Path(args.live_audio_out).expanduser().resolve()
-    else:
-        final_audio_path = out_dir / f"{base}.{final_audio_format}"
-    temp_wav_path = out_dir / f"{base}.capture_tmp.wav"
-
-    print(f"SRT: {srt_path.resolve()}")
-    print(f"TXT: {txt_path.resolve()}")
-    print(f"AUDIO: {final_audio_path.resolve()}")
-    print(f"Dispositivo: [{selected_index}] {selected_dev.get('name', '(sin nombre)')}")
-
-    strategy = str(args.live_strategy)
     stop_when_silent_for = resolve_stop_when_silent_for(args)
     require_punctuation = resolve_require_punctuation(args)
-    needs_streaming = strategy in {"streaming", "hybrid"}
-    needs_final_pass = should_regenerate_final_outputs(strategy)
-    paused_for_silence = False
-    force_final_pass_on_exit = False
-
-    model = None
-    if needs_streaming:
-        print(f"Cargando modelo Whisper ({args.model}, {args.device_compute})...")
-        model = whisper.load_model(args.model, device=args.device_compute)
-
-    audio_q: queue.Queue = queue.Queue(maxsize=128)
-    stop_event = threading.Event()
-    stats = LiveStats()
-    stats_lock = threading.Lock()
-    activity_lock = threading.Lock()
-    wav_lock = threading.Lock()
-    disk_full_event = threading.Event()
-    disk_error_message = ""
-
-    chunk_samples = int(args.chunk_seconds * TARGET_SR)
-    overlap_samples = int(args.overlap_seconds * TARGET_SR)
-    overlap_samples = min(overlap_samples, max(0, chunk_samples - 1))
-    stride_samples = max(1, chunk_samples - overlap_samples)
 
     stream_sr = int(args.sample_rate)
     stream_channels = int(args.channels)
+    device_name = selected_dev.get("name", "(unnamed)")
 
-    temp_wav_path.parent.mkdir(parents=True, exist_ok=True)
-    wav_fh = wave.open(str(temp_wav_path), "wb")
-    wav_fh.setnchannels(1)
-    wav_fh.setsampwidth(2)
-    wav_fh.setframerate(TARGET_SR)
+    chapter_lock = threading.Lock()
+    model_lock = threading.Lock()
+    processing_done = threading.Event()
+    processing_done.set()
+    stop_event = threading.Event()
+    disk_full_event = threading.Event()
+    processing_error: Optional[str] = None
+    disk_error_message = ""
+    chapter_index = 0
+    chapter_active = False
+    chapter_wav_fh: Optional[wave.Wave_write] = None
+    chapter_wav_path: Optional[Path] = None
+    chapter_txt_path: Optional[Path] = None
+    chapter_srt_path: Optional[Path] = None
+    chapter_audio_path: Optional[Path] = None
+    chapter_last_sound = time.monotonic()
+    active_outputs: List[Tuple[Path, Path, Path]] = []
+    loaded_model = None
+    processing_thread: Optional[threading.Thread] = None
 
-    writers = IncrementalWriters(txt_path=txt_path, srt_path=srt_path) if needs_streaming else None
-    start_monotonic = time.monotonic()
-    last_sound_monotonic = start_monotonic
-    slot_has_sound = False
+    def build_chapter_paths(index: int) -> Tuple[Path, Path, Path, Path]:
+        suffix = f"{index:03d}"
+        txt_path = out_dir / f"{base}_{suffix}.txt"
+        srt_path = out_dir / f"{base}_{suffix}.srt"
+        wav_path = out_dir / f"{base}_{suffix}.capture_tmp.wav"
+        if args.live_audio_out:
+            configured = Path(args.live_audio_out).expanduser().resolve()
+            ext = configured.suffix if configured.suffix else f".{final_audio_format}"
+            audio_path = configured.with_name(f"{configured.stem}_{suffix}{ext}")
+        else:
+            audio_path = out_dir / f"{base}_{suffix}.{final_audio_format}"
+        return txt_path, srt_path, audio_path, wav_path
 
-    def callback(indata, frames, time_info, status):
-        nonlocal last_sound_monotonic, slot_has_sound, disk_error_message
-        del frames, time_info
-        mono = to_mono_float32(indata)
-        mono_16k = resample_linear(mono, stream_sr, TARGET_SR)
-        if rms(mono_16k) >= args.rms_threshold:
-            now = time.monotonic()
-            with activity_lock:
-                last_sound_monotonic = now
-                slot_has_sound = True
-        pcm = float32_to_pcm16(mono_16k)
+    def close_active_chapter(reason: str) -> Optional[Tuple[Path, Path, Path, Path]]:
+        nonlocal chapter_active, chapter_wav_fh
+        nonlocal chapter_wav_path, chapter_txt_path, chapter_srt_path, chapter_audio_path
+        with chapter_lock:
+            if not chapter_active or chapter_wav_fh is None:
+                return None
+            wav_fh = chapter_wav_fh
+            wav_path = chapter_wav_path
+            txt_path = chapter_txt_path
+            srt_path = chapter_srt_path
+            audio_path = chapter_audio_path
+            chapter_active = False
+            chapter_wav_fh = None
+            chapter_wav_path = None
+            chapter_txt_path = None
+            chapter_srt_path = None
+            chapter_audio_path = None
+        assert wav_path is not None and txt_path is not None and srt_path is not None and audio_path is not None
+        wav_fh.close()
+        print()
+        print(f"Chapter closed ({reason}): {txt_path.stem}")
+        return txt_path, srt_path, audio_path, wav_path
+
+    def start_new_chapter() -> bool:
+        nonlocal chapter_index, chapter_active, chapter_wav_fh
+        nonlocal chapter_wav_path, chapter_txt_path, chapter_srt_path, chapter_audio_path
+        nonlocal chapter_last_sound
+        if not processing_done.is_set():
+            print("The previous chapter is still processing. Wait before starting the next one.")
+            return False
+        with chapter_lock:
+            if chapter_active:
+                return False
+            chapter_index += 1
+            txt_path, srt_path, audio_path, wav_path = build_chapter_paths(chapter_index)
+            wav_path.parent.mkdir(parents=True, exist_ok=True)
+            wav_fh = wave.open(str(wav_path), "wb")
+            wav_fh.setnchannels(1)
+            wav_fh.setsampwidth(2)
+            wav_fh.setframerate(TARGET_SR)
+            chapter_active = True
+            chapter_wav_fh = wav_fh
+            chapter_wav_path = wav_path
+            chapter_txt_path = txt_path
+            chapter_srt_path = srt_path
+            chapter_audio_path = audio_path
+            chapter_last_sound = time.monotonic()
+
+        print()
+        print(f"Chapter started: {base}_{chapter_index:03d}")
+        print(f"SRT: {srt_path.resolve()}")
+        print(f"TXT: {txt_path.resolve()}")
+        print(f"AUDIO: {audio_path.resolve()}")
+        return True
+
+    def process_chapter(txt_path: Path, srt_path: Path, audio_path: Path, wav_path: Path) -> None:
+        nonlocal loaded_model
+        with model_lock:
+            if loaded_model is None:
+                print(f"Loading Whisper model ({args.model}, {args.device_compute})...")
+                loaded_model = whisper.load_model(args.model, device=args.device_compute)
+            local_model = loaded_model
+
+        print(f"Processing chapter: {txt_path.stem}")
+        result = local_model.transcribe(
+            str(wav_path),
+            language=args.language,
+            fp16=(args.device_compute == "cuda"),
+            verbose=False,
+        )
+        raw_segments = extract_timed_segments(result)
+        merged = merge_for_readability(
+            segments=raw_segments,
+            merge_gap_seconds=float(args.merge_gap_seconds),
+            min_segment_seconds=float(args.min_segment_seconds),
+            min_final_words=int(args.min_final_words),
+            require_punctuation=require_punctuation,
+        )
+        write_final_outputs(txt_path=txt_path, srt_path=srt_path, segments=merged)
+
         try:
-            with wav_lock:
-                wav_fh.writeframesraw(pcm)
-        except OSError as ex:
-            disk_error_message = f"Error escribiendo WAV temporal: {ex}"
-            disk_full_event.set()
-            stop_event.set()
+            audio_format = audio_path.suffix.lstrip(".").lower() or final_audio_format
+            convert_wav_to_audio(
+                wav_path,
+                audio_path,
+                audio_format,
+                ffmpeg_hint=getattr(args, "ffmpeg_path", ""),
+            )
+        except Exception as ex:
+            print(f"Warning: failed to convert final audio ({ex}). Temporary WAV kept: {wav_path}")
+            active_outputs.append((txt_path, srt_path, wav_path))
             return
 
-        try:
-            if needs_streaming:
-                audio_q.put_nowait(mono_16k.copy())
-        except queue.Full:
-            with stats_lock:
-                stats.dropped_blocks += 1
+        wav_path.unlink(missing_ok=True)
+        active_outputs.append((txt_path, srt_path, audio_path))
+        print(f"Chapter ready: {txt_path.stem}")
 
-    def transcription_worker():
-        assert model is not None
-        assert writers is not None
-        pending = np.array([], dtype=np.float32)
-        chunk_start_sec = 0.0
+    def launch_processing(paths: Tuple[Path, Path, Path, Path]) -> None:
+        nonlocal processing_thread, processing_error
+        if not processing_done.is_set():
+            print("Processing is in progress; another chapter cannot start yet.")
+            return
+        processing_done.clear()
 
-        while not stop_event.is_set() or not audio_q.empty():
+        def _target() -> None:
+            nonlocal processing_error
             try:
-                block = audio_q.get(timeout=0.5)
-            except queue.Empty:
-                continue
+                process_chapter(*paths)
+            except Exception as ex:
+                processing_error = str(ex)
+                print(f"Error while processing chapter: {ex}")
+            finally:
+                processing_done.set()
 
-            with stats_lock:
-                stats.capture_samples_16k += len(block)
-                stats.state = "grabando"
+        processing_thread = threading.Thread(target=_target, daemon=True)
+        processing_thread.start()
 
-            if block.size == 0:
-                continue
+    def callback(indata, frames, time_info, status):
+        nonlocal chapter_last_sound, disk_error_message
+        del frames, time_info
+        if status:
+            return
+        mono = to_mono_float32(indata)
+        mono_16k = resample_linear(mono, stream_sr, TARGET_SR)
+        level = rms(mono_16k)
+        pcm = float32_to_pcm16(mono_16k)
+        try:
+            with chapter_lock:
+                if not chapter_active or chapter_wav_fh is None:
+                    return
+                if level >= args.rms_threshold:
+                    chapter_last_sound = time.monotonic()
+                chapter_wav_fh.writeframesraw(pcm)
+        except OSError as ex:
+            disk_error_message = f"Error writing temporary WAV: {ex}"
+            disk_full_event.set()
+            stop_event.set()
 
-            pending = np.concatenate([pending, block])
-
-            while len(pending) >= chunk_samples:
-                chunk = pending[:chunk_samples]
-                pending = pending[stride_samples:]
-
-                if rms(chunk) < args.rms_threshold:
-                    with stats_lock:
-                        stats.chunks_skipped_silence += 1
-                        stats.transcribed_seconds = chunk_start_sec + (chunk_samples / TARGET_SR)
-                    chunk_start_sec += stride_samples / TARGET_SR
-                    continue
-
-                with stats_lock:
-                    stats.state = "transcribiendo"
-
-                result = model.transcribe(
-                    audio=chunk,
-                    language=args.language,
-                    fp16=(args.device_compute == "cuda"),
-                    verbose=False,
-                    condition_on_previous_text=False,
-                    temperature=0.0,
-                )
-
-                with stats_lock:
-                    stats.state = "escribiendo"
-
-                segments = result.get("segments", []) or []
-                if not segments:
-                    txt = (result.get("text") or "").strip()
-                    if txt:
-                        writers.append_txt(txt)
-                        start = chunk_start_sec
-                        end = chunk_start_sec + args.chunk_seconds
-                        writers.append_srt_segment(start, end, txt)
-                else:
-                    for seg in segments:
-                        seg_text = str(seg.get("text", "")).strip()
-                        if not seg_text:
-                            continue
-                        start = chunk_start_sec + float(seg.get("start", 0.0))
-                        end = chunk_start_sec + float(seg.get("end", 0.0))
-                        writers.append_txt(seg_text)
-                        writers.append_srt_segment(start, end, seg_text)
-
-                with stats_lock:
-                    stats.chunks_processed += 1
-                    stats.transcribed_seconds = chunk_start_sec + (chunk_samples / TARGET_SR)
-                    stats.state = "grabando"
-
-                chunk_start_sec += stride_samples / TARGET_SR
-
-        if len(pending) >= TARGET_SR:
-            chunk = pending
-            if rms(chunk) >= args.rms_threshold:
-                with stats_lock:
-                    stats.state = "transcribiendo"
-                result = model.transcribe(
-                    audio=chunk,
-                    language=args.language,
-                    fp16=(args.device_compute == "cuda"),
-                    verbose=False,
-                    condition_on_previous_text=False,
-                    temperature=0.0,
-                )
-                with stats_lock:
-                    stats.state = "escribiendo"
-                segments = result.get("segments", []) or []
-                if segments:
-                    for seg in segments:
-                        seg_text = str(seg.get("text", "")).strip()
-                        if not seg_text:
-                            continue
-                        start = chunk_start_sec + float(seg.get("start", 0.0))
-                        end = chunk_start_sec + float(seg.get("end", 0.0))
-                        writers.append_txt(seg_text)
-                        writers.append_srt_segment(start, end, seg_text)
-                else:
-                    txt = (result.get("text") or "").strip()
-                    if txt:
-                        writers.append_txt(txt)
-                        writers.append_srt_segment(chunk_start_sec, chunk_start_sec + len(chunk) / TARGET_SR, txt)
-
-            with stats_lock:
-                stats.state = "grabando"
-
-    worker = None
-    if needs_streaming:
-        worker = threading.Thread(target=transcription_worker, daemon=True)
-        worker.start()
-
-    device_name = selected_dev.get("name", "(sin nombre)")
-    print("Iniciando captura live. Pulsa Ctrl+C para detener.")
-    print(
-        f"Escuchando [{device_name}] | marca cada {LIVE_ACTIVITY_SLOT_SECONDS:.0f}s "
-        f"(###=sonido, ___=silencio)"
-    )
-    activity_markers: List[str] = []
-    next_activity_tick = start_monotonic + LIVE_ACTIVITY_SLOT_SECONDS
-    last_line_len = 0
+    print(f"Input device: [{selected_index}] {device_name}")
+    print("Starting live chapter mode.")
+    print("press spacebar to stop and switch chapter")
+    print("Press ESC to exit.")
+    start_new_chapter()
 
     try:
         with sd.InputStream(
@@ -963,150 +943,108 @@ def run_live_mode(args: argparse.Namespace) -> int:
                 pressed_key = read_pressed_key()
                 if pressed_key == "\x1b":
                     print()
-                    print("ESC detectado. Cerrando captura y generando salida final de calidad...")
-                    force_final_pass_on_exit = True
+                    print("ESC detected. Closing session...")
+                    paths = close_active_chapter("exit")
+                    if paths is not None:
+                        launch_processing(paths)
                     stop_event.set()
                     break
-                time.sleep(args.heartbeat_seconds)
+
+                if pressed_key == " ":
+                    if processing_done.is_set():
+                        paths = close_active_chapter("spacebar")
+                        if paths is None:
+                            start_new_chapter()
+                        else:
+                            launch_processing(paths)
+                    else:
+                        print("Previous chapter is still processing. SPACE is temporarily blocked.")
+
+                time.sleep(max(0.1, float(args.heartbeat_seconds)))
+
                 if disk_full_event.is_set():
                     print()
-                    print(disk_error_message or "Error de escritura en disco. Finalizando captura live.")
+                    print(disk_error_message or "Disk write error. Ending live capture.")
+                    paths = close_active_chapter("disk error")
+                    if paths is not None and processing_done.is_set():
+                        launch_processing(paths)
                     stop_event.set()
                     break
-                now = time.monotonic()
-                with activity_lock:
-                    silent_for = now - last_sound_monotonic
 
                 if args.min_free_mb_stop > 0:
-                    free_bytes = shutil.disk_usage(temp_wav_path.parent).free
+                    free_bytes = shutil.disk_usage(out_dir).free
                     if free_bytes < int(args.min_free_mb_stop * 1024 * 1024):
                         print()
                         print(
-                            "Espacio libre insuficiente en disco "
-                            f"(< {args.min_free_mb_stop:.0f} MB). Finalizando captura live."
+                            "Insufficient free disk space "
+                            f"(< {args.min_free_mb_stop:.0f} MB). Ending live capture."
                         )
+                        paths = close_active_chapter("insufficient disk space")
+                        if paths is not None and processing_done.is_set():
+                            launch_processing(paths)
                         stop_event.set()
                         break
 
-                if paused_for_silence and silent_for < max(0.25, float(args.heartbeat_seconds)):
-                    print()
-                    print("--- REANUDADO (Audio Detectado) ---")
-                    paused_for_silence = False
+                with chapter_lock:
+                    active = chapter_active
+                    silent_for = time.monotonic() - chapter_last_sound
 
-                if not paused_for_silence and silent_for >= stop_when_silent_for:
+                if active and silent_for >= stop_when_silent_for:
                     print()
                     emit_pause_beeps(3)
-                    print("--- PAUSED (Silence Detected) ---")
-                    print("Presiona ESC para salir o espera a que vuelva el audio para reanudar.")
-                    paused_for_silence = True
-
-                if paused_for_silence:
-                    pressed_key = read_pressed_key()
-                    if pressed_key:
-                        print()
-                        print("Tecla detectada en pausa. Cerrando captura y generando salida final de calidad...")
-                        force_final_pass_on_exit = True
-                        stop_event.set()
-                        break
-                    continue
-
-                while now >= next_activity_tick and not stop_event.is_set():
-                    with activity_lock:
-                        marker = "###" if slot_has_sound else "___"
-                        slot_has_sound = False
-                    activity_markers.append(marker)
-                    if len(activity_markers) > LIVE_ACTIVITY_SLOTS_PER_LINE:
-                        activity_markers = activity_markers[-LIVE_ACTIVITY_SLOTS_PER_LINE:]
-
-                    line = f"Escuchando [{device_name}] {' '.join(activity_markers)}"
-                    clear = "\r" + (" " * last_line_len) + "\r"
-                    print(clear + line, end="", flush=True)
-                    last_line_len = len(line)
-                    next_activity_tick += LIVE_ACTIVITY_SLOT_SECONDS
-
-                    if len(activity_markers) == LIVE_ACTIVITY_SLOTS_PER_LINE:
-                        time.sleep(0.1)
-                        print("\r" + (" " * last_line_len) + "\r", end="", flush=True)
-                        last_line_len = 0
-                        activity_markers = []
+                    paths = close_active_chapter("silence")
+                    if paths is not None:
+                        launch_processing(paths)
+                    print("Chapter is processing. Press SPACE to start another when done, or ESC to exit.")
 
     except KeyboardInterrupt:
-        print("Deteniendo captura...")
-        force_final_pass_on_exit = True
-    finally:
         print()
-        stop_event.set()
-        if worker is not None:
-            worker.join(timeout=15)
-        if writers is not None:
-            writers.close()
-        with wav_lock:
-            wav_fh.close()
+        print("Stopping capture due to Ctrl+C...")
+        paths = close_active_chapter("ctrl+c")
+        if paths is not None:
+            launch_processing(paths)
+    finally:
+        if processing_thread is not None:
+            processing_thread.join()
 
-    if needs_final_pass or force_final_pass_on_exit:
-        if model is None:
-            print(f"Cargando modelo Whisper ({args.model}, {args.device_compute})...")
-            model = whisper.load_model(args.model, device=args.device_compute)
-        print("Generando transcripcion final desde WAV temporal...")
-        result = model.transcribe(
-            str(temp_wav_path),
-            language=args.language,
-            fp16=(args.device_compute == "cuda"),
-            verbose=False,
-        )
-        raw_segments = extract_timed_segments(result)
-        merged = merge_for_readability(
-            segments=raw_segments,
-            merge_gap_seconds=float(args.merge_gap_seconds),
-            min_segment_seconds=float(args.min_segment_seconds),
-            min_final_words=int(args.min_final_words),
-            require_punctuation=require_punctuation,
-        )
-        write_final_outputs(txt_path=txt_path, srt_path=srt_path, segments=merged)
-    elif not txt_path.exists():
-        txt_path.write_text("", encoding="utf-8")
-        srt_path.write_text("", encoding="utf-8")
+    if processing_error:
+        print(f"Finished with errors: {processing_error}")
+        return 1
 
-    try:
-        convert_wav_to_audio(
-            temp_wav_path,
-            final_audio_path,
-            final_audio_format,
-            ffmpeg_hint=getattr(args, "ffmpeg_path", ""),
-        )
-    except Exception as ex:
-        print(f"Advertencia: no se pudo convertir audio final ({ex}). Se conserva WAV temporal.")
-        final_audio_path = temp_wav_path
-    else:
-        if final_audio_path != temp_wav_path and temp_wav_path.exists():
-            temp_wav_path.unlink(missing_ok=True)
+    print("Finished.")
+    if not active_outputs:
+        print("No chapters were generated.")
+        return 0
 
-    print("Finalizado.")
-    print(f"SRT: {srt_path.resolve()}")
-    print(f"TXT: {txt_path.resolve()}")
-    print(f"AUDIO: {final_audio_path.resolve()}")
+    print("Generated outputs:")
+    for txt_path, srt_path, audio_path in active_outputs:
+        print(f"TXT: {txt_path.resolve()}")
+        print(f"SRT: {srt_path.resolve()}")
+        print(f"AUDIO: {audio_path.resolve()}")
     return 0
 
 
 def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Transcribe audio en modo archivo o live y genera salidas TXT/SRT. "
-            "Incluye deduplicacion por solape, heartbeat de estado y escritura incremental."
+            "Transcribe audio in file or live mode and generate TXT/SRT outputs. "
+            "Includes overlap-aware deduplication, status heartbeat, and incremental writes."
         ),
         epilog=(
-            "Modo file (parametros): audio, --output-dir, --txt-out, --srt-out. \n"
-            "Modo live (parametros): --list-devices, --input-device, --device-index, \n"
+            "File mode (parameters): audio, --output-dir, --txt-out, --srt-out. \n"
+            "Live mode (parameters): --list-devices, --input-device, --device-index, \n"
             "--output-dir, --output-prefix, --chunk-seconds, --overlap-seconds, \n"
             "--heartbeat-seconds, --rms-threshold, --sample-rate, --channels, \n"
             "--live-strategy, --live-audio-out, --live-audio-format, --stop_when_silent_for, \n"
             "--merge-gap-seconds, --min-free-mb-stop. \n"
-            "Ejemplo file: CallGhost.py file audio.ogg --output-dir ./salida. \n"
-            "Ejemplo live calidad: CallGhost.py live --live-strategy final-pass --output-dir ./salida \n"
-            "(captura live y genera TXT/SRT finales al terminar). \n"
-            "Ejemplo live hybrid: CallGhost.py live --live-strategy hybrid --output-dir ./salida \n"
-            "(provisional en vivo + regeneracion final limpia). \n"
-            "Nota: streaming puede degradar legibilidad final por fragmentacion en tiempo real.\n"
+            "Live chapter mode: SPACE closes/opens chapters (only when processing is idle), \n"
+            "ESC exits the session after finalizing the active chapter. \n"
+            "File example: CallGhost.py file audio.ogg --output-dir ./output. \n"
+            "Live quality example: CallGhost.py live --live-strategy final-pass --output-dir ./output \n"
+            "(captures live audio and generates final TXT/SRT at the end). \n"
+            "Live hybrid example: CallGhost.py live --live-strategy hybrid --output-dir ./output \n"
+            "(live provisional output + final clean regeneration). \n"
+            "Note: streaming may reduce final readability due to real-time segmentation.\n"
         ),
         formatter_class=argparse.RawTextHelpFormatter
     )
@@ -1114,156 +1052,156 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument(
         "--config",
         default=str(DEFAULT_CONFIG_PATH),
-        help="Ruta a config.ini. Si no existe, se genera automaticamente.",
+        help="Path to config.ini. If missing, it is auto-generated.",
     )
     parser.add_argument(
         "--model",
         default=defaults["model"],
-        help="Modelo Whisper local (tiny, base, small, medium, large)",
+        help="Local Whisper model (tiny, base, small, medium, large).",
     )
-    parser.add_argument("--language", default=defaults["language"], help="Idioma ISO (ej. es, en, fr).")
+    parser.add_argument("--language", default=defaults["language"], help="ISO language code (e.g., es, en, fr).")
     parser.add_argument(
         "--device-compute",
         default=defaults["device_compute"],
         choices=["cpu", "cuda"],
-        help="Dispositivo de inferencia para Whisper.",
+        help="Compute device for Whisper inference.",
     )
     parser.add_argument(
         "--ffmpeg-path",
         default=defaults["ffmpeg_path"],
-        help="Ruta explicita a ffmpeg. Si se omite, se busca en bin/ o PATH.",
+        help="Explicit ffmpeg path. If omitted, it is resolved from bin/ or PATH.",
     )
 
     subparsers = parser.add_subparsers(dest="mode")
 
     p_file = subparsers.add_parser(
         "file",
-        help="Transcribe un archivo de audio.",
+        help="Transcribe an audio file.",
         description=(
-            "Modo archivo: procesa un audio completo y guarda TXT/SRT. "
-            "Si no se indica --output-dir, usa la carpeta del audio de entrada."
+            "File mode: process a full audio file and write TXT/SRT outputs. "
+            "If --output-dir is omitted, the input file directory is used."
         ),
     )
-    p_file.add_argument("audio", help="Ruta al archivo de audio (ej. archivo.ogg)")
-    p_file.add_argument("--output-dir", default=defaults["output_dir"], help="Directorio de salida para TXT/SRT")
-    p_file.add_argument("--txt-out", default=defaults["txt_out"], help="Ruta completa del TXT de salida")
-    p_file.add_argument("--srt-out", default=defaults["srt_out"], help="Ruta completa del SRT de salida")
+    p_file.add_argument("audio", help="Path to the input audio file (e.g., audio.ogg).")
+    p_file.add_argument("--output-dir", default=defaults["output_dir"], help="Output directory for TXT/SRT.")
+    p_file.add_argument("--txt-out", default=defaults["txt_out"], help="Full output path for TXT.")
+    p_file.add_argument("--srt-out", default=defaults["srt_out"], help="Full output path for SRT.")
 
     p_live = subparsers.add_parser(
         "live",
-        help="Transcribe en casi tiempo real desde dispositivo de entrada.",
+        help="Transcribe near real-time audio from an input device.",
         description=(
-            "Modo live orientado a calidad: captura audio en WAV mono 16k y, por defecto, "
-            "genera TXT/SRT finales al terminar (final-pass)."
+            "Quality-oriented live mode: capture 16k mono WAV and, by default, "
+            "generate final TXT/SRT at the end (final-pass)."
         ),
     )
-    p_live.add_argument("--list-devices", action="store_true", help="Lista dispositivos de entrada y sale.")
+    p_live.add_argument("--list-devices", action="store_true", help="List input devices and exit.")
     p_live.add_argument(
         "--input-device",
         default=defaults["input_device"],
         help=(
-            "Texto a buscar en el nombre del dispositivo de entrada. "
+            "Substring to match in the input device name. "
             "Default: 'CABLE Output'."
         ),
     )
-    p_live.add_argument("--device-index", type=int, default=defaults["device_index"], help="Indice numerico del dispositivo de entrada.")
-    p_live.add_argument("--output-dir", default=defaults["output_dir"], help="Directorio donde se guardaran TXT/SRT.")
-    p_live.add_argument("--output-prefix", default=defaults["output_prefix"], help="Prefijo base para los archivos live.")
+    p_live.add_argument("--device-index", type=int, default=defaults["device_index"], help="Numeric input device index.")
+    p_live.add_argument("--output-dir", default=defaults["output_dir"], help="Output directory for TXT/SRT.")
+    p_live.add_argument("--output-prefix", default=defaults["output_prefix"], help="Base prefix for live output files.")
     p_live.add_argument(
         "--live-strategy",
         choices=["final-pass", "hybrid", "streaming"],
         default=defaults["live_strategy"],
-        help="Estrategia live. Default: final-pass (maxima calidad final).",
+        help="Live strategy. Default: final-pass (best final quality).",
     )
     p_live.add_argument(
         "--live-audio-out",
         default=defaults["live_audio_out"],
-        help="Ruta del audio final capturado. Si no se indica, se autogenera con --live-audio-format.",
+        help="Final captured audio path. If omitted, it is auto-generated from --live-audio-format.",
     )
     p_live.add_argument(
         "--live-audio-format",
         choices=["ogg", "mp3", "wav"],
         default=defaults["live_audio_format"],
-        help="Formato del audio final guardado. Default: ogg.",
+        help="Output format for final captured audio. Default: ogg.",
     )
     p_live.add_argument(
         "--chunk-seconds",
         type=float,
         default=defaults["chunk_seconds"],
-        help="Tamano de chunk (s) para streaming/hybrid. Default: 6.0.",
+        help="Chunk length (s) for streaming/hybrid. Default: 6.0.",
     )
     p_live.add_argument(
         "--overlap-seconds",
         type=float,
         default=defaults["overlap_seconds"],
-        help="Solape entre chunks (s) para streaming/hybrid. Default: 1.0.",
+        help="Chunk overlap (s) for streaming/hybrid. Default: 1.0.",
     )
     p_live.add_argument(
         "--heartbeat-seconds",
         type=float,
         default=defaults["heartbeat_seconds"],
-        help="Refresco de consola en live (s). Default: 1.0.",
+        help="Live console heartbeat interval (s). Default: 1.0.",
     )
-    p_live.add_argument("--rms-threshold", type=float, default=defaults["rms_threshold"], help="Umbral RMS para saltar silencio.")
+    p_live.add_argument("--rms-threshold", type=float, default=defaults["rms_threshold"], help="RMS threshold used to treat audio as silence.")
     p_live.add_argument(
         "--sample-rate",
         type=int,
         default=defaults["sample_rate"],
-        help="Sample rate del stream de captura. Default: 16000 Hz.",
+        help="Capture stream sample rate. Default: 16000 Hz.",
     )
     p_live.add_argument(
         "--channels",
         type=int,
         default=defaults["channels"],
-        help="Canales de captura. Default: 1 (mono).",
+        help="Capture channel count. Default: 1 (mono).",
     )
     p_live.add_argument(
         "--stop_when_silent_for",
         type=float,
         default=defaults["stop_when_silent_for"],
-        help="Detiene live tras este tiempo continuo de silencio (s). Default: 60.",
+        help="Auto-close the active chapter after this continuous silence duration (s). Default: 60.",
     )
     p_live.add_argument(
         "--stop_when_siltent_for",
         type=float,
         default=defaults["stop_when_siltent_for"],
-        help="Alias legacy con typo de --stop_when_silent_for.",
+        help="Legacy typo alias for --stop_when_silent_for.",
     )
     p_live.add_argument(
         "--min-free-mb-stop",
         type=float,
         default=512.0,
-        help="Detiene captura si el espacio libre baja de este umbral (MB). 0 para desactivar.",
+        help="Stop capture when free disk space drops below this threshold (MB). Use 0 to disable.",
     )
     p_live.add_argument(
         "--merge-gap-seconds",
         type=float,
         default=DEFAULT_MERGE_GAP_SECONDS,
-        help="En final-pass/hybrid, fusiona segmentos separados por este gap maximo (s).",
+        help="In final-pass/hybrid, merge segments separated by up to this gap (s).",
     )
     p_live.add_argument(
         "--min-segment-seconds",
         type=float,
         default=DEFAULT_MIN_SEGMENT_SECONDS,
-        help="Duracion minima objetivo de segmento final (s).",
+        help="Target minimum duration for final segments (s).",
     )
     p_live.add_argument(
         "--min-final-words",
         type=int,
         default=DEFAULT_MIN_FINAL_WORDS,
-        help="Numero minimo de palabras por segmento final cuando sea posible.",
+        help="Target minimum words per final segment when possible.",
     )
     p_live.add_argument(
         "--require-punctuation",
         dest="require_punctuation",
         action="store_true",
-        help="En final-pass/hybrid, intenta cerrar segmentos con puntuacion final.",
+        help="In final-pass/hybrid, prefer closing segments on final punctuation.",
     )
     p_live.add_argument(
         "--no-require-punctuation",
         dest="require_punctuation",
         action="store_false",
-        help="No exige puntuacion final para cerrar segmentos.",
+        help="Do not require final punctuation to close segments.",
     )
     p_live.set_defaults(require_punctuation=defaults["require_punctuation"])
 
@@ -1313,10 +1251,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             args = interactive_startup(args)
         except (KeyboardInterrupt, EOFError):
             print()
-            print("Cancelado por usuario.")
+            print("Cancelled by user.")
             return 1
         except Exception as ex:
-            print(f"Error en modo interactivo: {ex}")
+            print(f"Interactive mode error: {ex}")
             return 1
     else:
         args = parser.parse_args(argv)
