@@ -1,0 +1,11 @@
+.venv
+bin/ffmpeg.exe
+__pycache__/
+*.pyc
+*.capture_tmp.wav
+recording/*.ogg
+recording/*.mp3
+recording/*.wav
+recording/*.srt
+recording/*.txt
+

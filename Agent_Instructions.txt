@@ -1,0 +1,60 @@
+Program: CallGhost
+Section 1: Explanation on the program and what id does
+Main idea: A program which listens an interface and provides SRT and TXT output from it, for later passing to other tools.
+Working instructions
+When program is started will try to locate all resources needed for this task downloading or requesting the path to required tools such as ffmpeg for audio conversion if needed
+It will present a menu with all possible input devices to capture sound from, it will display which ones are emiting sound or not with a small indicator of being silent or active
+It will capture audio from the selected device on previous menu
+When audio goes silent for a certain ammount of seconds, it beep three times to default output device and will show the message paused to allow user to continue recording once audio is restablished or end the program
+Program ending, can be done anytime pressing esc in menu, it will stop and generate ogg, srt and txt files in the desired output folder
+Program will read init parameters from a ini file, but will allow to override by passing them as parameter, create a ini file  with comments and defaults
+You can read file transcribe_summary.py to check which are the parameters, group in sections
+init config file notes and sections
+# app config and paths to tools
+# default capture mode or live device with their parameters
+# default capture spects format (16khz mono)
+# default capture outputs recording/YYY_MM_DD_recording.ogg, recording/YYY_MM_DD_recording.srt, recording/YYY_MM_DD_recording.txt
+
+Section 2: What you need to implement
+
+Task: Transform transcribe_summary.py into CallGhost.py with dual-mode execution logic.
+
+1. Startup Logic (No Arguments):
+
+If sys.argv is empty (length 1), initiate the Interactive Mode.
+
+Device Menu: Use list_input_devices() to print a numbered list.
+
+Live VU-Meter: Before the user picks a device, run a 3-second "silent monitor" loop. Show a simple ASCII bar [###  ] or a "Silent/Active" indicator next to each device based on rms() levels.
+
+User Pick: Wait for input() to select the device index.
+
+2. Execution Logic (With Arguments):
+
+If arguments are provided, bypass the menu and execute the requested mode (live or file) immediately, maintaining current functionality.
+
+3. Silence Beep Alert (New Feature):
+
+In run_live_mode, when silent_for >= stop_when_silent_for:
+
+Action: Trigger three system beeps (e.g., using print('\a') or a simple sine wave via sounddevice).
+
+UI: Display a prominent "--- PAUSED (Silence Detected) ---" message.
+
+Resume: Wait for audio levels to exceed rms_threshold to resume recording automatically, or wait for a keypress to exit.
+
+4. Config Persistence:
+
+Auto-generate config.ini if it doesn't exist.
+
+Ensure all argparse defaults are read from this file but can be overridden by CLI flags.
+
+5. Refinement:
+
+Keep all the overlap deduplication (dedupe_prefix_by_words) and the incremental writer logic.
+
+Ensure ESC key (or Ctrl+C) triggers the final-pass strategy for maximum SRT quality before closing.
+
+6. Final touches: 
+Create or append to .gitignore what is not required to run, create a default output directory with a README.md indicating this file is kept for creating the directory and is the default place to store generated audio and text files
+ 

@@ -1,0 +1,105 @@
+import whisper
+import sys
+import argparse
+import threading
+import time
+from datetime import datetime
+from pathlib import Path
+import shutil
+
+def get_audio_duration_seconds(audio_path):
+    audio = whisper.load_audio(str(audio_path))
+    return len(audio) / whisper.audio.SAMPLE_RATE
+
+
+def render_progress_bar(progress, width=30):
+    progress = max(0.0, min(progress, 1.0))
+    filled = int(width * progress)
+    bar = "#" * filled + "-" * (width - filled)
+    return f"[{bar}] {int(progress * 100):3d}%"
+
+
+def run_transcription_with_progress(model, audio_path, language, refresh_seconds=15):
+    result_holder = {"result": None, "error": None}
+    done_event = threading.Event()
+
+    try:
+        duration = get_audio_duration_seconds(audio_path)
+    except Exception:
+        duration = None
+
+    def worker():
+        try:
+            result_holder["result"] = model.transcribe(str(audio_path), language=language)
+        except Exception as e:
+            result_holder["error"] = e
+        finally:
+            done_event.set()
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+
+    start = time.time()
+    # Factor de estimación para no llegar al 100% antes de terminar.
+    estimation_factor = 1.2
+
+    while not done_event.wait(timeout=refresh_seconds):
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+        if duration and duration > 0:
+            elapsed = time.time() - start
+            estimated_progress = min(elapsed / (duration * estimation_factor), 0.95)
+            bar = render_progress_bar(estimated_progress)
+            print(f"Progreso transcripción {bar} | {now_str}")
+        else:
+            print(f"Transcribiendo... | {now_str}")
+
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    print(f"Progreso transcripción {render_progress_bar(1.0)} | {now_str}")
+
+    if result_holder["error"] is not None:
+        raise result_holder["error"]
+
+    return result_holder["result"]
+
+
+def main(audio_path, language="es"):
+    audio_path = Path(audio_path)
+    if not audio_path.exists():
+        print("Archivo no encontrado.")
+        return
+
+    print("Cargando modelo Whisper (small, CPU)...")
+    model = whisper.load_model("small", device="cpu")
+
+    print("Transcribiendo... esto puede tardar.")
+    result = run_transcription_with_progress(model, audio_path, language, refresh_seconds=15)
+
+    base_name = audio_path.stem
+    txt_path = audio_path.parent / f"{base_name}.txt"
+
+    print("Guardando transcripción TXT...")
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write(result["text"].strip() + "\n")
+
+    print("\nListo.")
+    print("Transcripción:", txt_path)
+
+
+if __name__ == "__main__":
+    if shutil.which("ffmpeg") is None:
+        print("Error: 'ffmpeg' no está disponible en PATH. Instálalo y añade al PATH.")
+        print("En Windows: choco install ffmpeg -y  (o descarga en https://ffmpeg.org)")
+        sys.exit(1)
+        
+    parser = argparse.ArgumentParser(
+        description="Transcribe audio y genera un TXT con el texto extraido."
+    )
+    parser.add_argument("audio", help="Ruta al archivo de audio (por ejemplo, archivo.ogg)")
+    parser.add_argument(
+        "--language",
+        default="es",
+        help="Idioma de reconocimiento (código ISO, por ejemplo: es, en, fr). Por defecto: es",
+    )
+    args = parser.parse_args(sys.argv[1:])
+
+    main(args.audio, language=args.language)
